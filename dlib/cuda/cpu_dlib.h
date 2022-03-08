@@ -8,7 +8,7 @@
 
 #include "tensor.h"
 #include "../geometry/rectangle.h"
-#include "../dnn/misc.h"
+#include "../dnn/utilities.h"
 
 namespace dlib
 {
@@ -423,20 +423,20 @@ namespace dlib
 
         void resize_bilinear (
             tensor& dest,
-            long dest_row_stride,
-            long dest_channel_stride,
+            long long dest_row_stride,
+            long long dest_channel_stride,
             const tensor& src,
-            long src_row_stride,
-            long src_channel_stride
+            long long src_row_stride,
+            long long src_channel_stride
         );
 
         void resize_bilinear_gradient (
             tensor& grad,
-            long grad_row_stride,
-            long grad_channel_stride,
+            long long grad_row_stride,
+            long long grad_channel_stride,
             const tensor& gradient_input,
-            long gradient_input_row_stride,
-            long gradient_input_channel_stride
+            long long gradient_input_row_stride,
+            long long gradient_input_channel_stride
         );
 
         inline void resize_bilinear (
@@ -448,6 +448,22 @@ namespace dlib
             tensor& grad,
             const tensor& gradient_input
         ) { resize_bilinear_gradient(grad, grad.nc(), grad.nr()*grad.nc(), gradient_input, gradient_input.nc(), gradient_input.nr()*gradient_input.nc()); }
+
+    // -----------------------------------------------------------------------------------
+
+        void reorg (
+            tensor& dest,
+            const int row_stride,
+            const int col_stride,
+            const tensor& src
+        );
+
+        void reorg_gradient (
+            tensor& grad,
+            const int row_stride,
+            const int col_stride,
+            const tensor& gradient_input
+        );
 
     // -----------------------------------------------------------------------------------
 

@@ -1732,11 +1732,11 @@ namespace dlib
 
         void resize_bilinear (
             tensor& dest,
-            long dest_row_stride,
-            long dest_channel_stride,
+            long long dest_row_stride,
+            long long dest_channel_stride,
             const tensor& src,
-            long src_row_stride,
-            long src_channel_stride
+            long long src_row_stride,
+            long long src_channel_stride
         )
         {
             DLIB_CASSERT(is_same_object(dest, src)==false);
@@ -1838,11 +1838,11 @@ namespace dlib
 
         void resize_bilinear_gradient (
             tensor& grad,
-            long grad_row_stride,
-            long grad_channel_stride,
+            long long grad_row_stride,
+            long long grad_channel_stride,
             const tensor& gradient_input,
-            long gradient_input_row_stride,
-            long gradient_input_channel_stride
+            long long gradient_input_row_stride,
+            long long gradient_input_channel_stride
         )
         {
             DLIB_CASSERT(is_same_object(grad, gradient_input)==false);
@@ -1870,6 +1870,92 @@ namespace dlib
                         grad_channel_stride, grad.nr(), grad.nc(), grad.device(),
                         x_scale, y_scale, gradient_input_row_stride, grad_row_stride, gradient_input_channel_stride);
             }
+        }
+
+    // ----------------------------------------------------------------------------------------
+
+        __global__ void _cuda_reorg(size_t dsize, size_t dk, size_t dnr, size_t dnc, float* d,
+                                    size_t sk, size_t snr, int snc, const float* s,
+                                    const size_t row_stride, const size_t col_stride)
+        {
+            const auto out_plane_size = dnr * dnc;
+            const auto sample_size = dk * out_plane_size;
+            for(auto i : grid_stride_range(0, dsize))
+            {
+                const auto n = i / sample_size;
+                const auto idx = i % out_plane_size;
+                const auto out_k = (i / out_plane_size) % dk;
+                const auto out_r = idx / dnc;
+                const auto out_c = idx % dnc;
+
+                const auto in_k = out_k % sk;
+                const auto in_r = out_r * row_stride + (out_k / sk) / row_stride;
+                const auto in_c = out_c * col_stride + (out_k / sk) % col_stride;
+
+                const auto in_idx = ((n * sk + in_k) * snr + in_r) * snc + in_c;
+                d[i] = s[in_idx];
+            }
+        }
+        __global__ void _cuda_reorg_gradient(size_t ssize, size_t dk, size_t dnr, size_t dnc, float* d,
+                                             size_t sk, size_t snr, int snc, const float* s,
+                                             const size_t row_stride, const size_t col_stride)
+        {
+            const auto in_plane_size = snr * snc;
+            const auto sample_size = sk * in_plane_size;
+            for(auto i : grid_stride_range(0, ssize))
+            {
+                const auto n = i / sample_size;
+                const auto idx = i % in_plane_size;
+                const auto in_k = (i / in_plane_size) % sk;
+                const auto in_r = idx / snc;
+                const auto in_c = idx % snc;
+
+                const auto out_k = in_k % dk;
+                const auto out_r = in_r * row_stride + (in_k / dk) / row_stride;
+                const auto out_c = in_c * col_stride + (in_k / dk) % col_stride;
+
+                const auto out_idx = ((n * dk + out_k) * dnr + out_r) * dnc + out_c;
+                d[out_idx] += s[i];
+            }
+        }
+
+        void reorg (
+            tensor& dest,
+            const int row_stride,
+            const int col_stride,
+            const tensor& src
+        )
+        {
+            DLIB_CASSERT(is_same_object(dest, src)==false);
+            DLIB_CASSERT(src.nr() % row_stride == 0);
+            DLIB_CASSERT(src.nc() % col_stride == 0);
+            DLIB_CASSERT(dest.num_samples() == src.num_samples());
+            DLIB_CASSERT(dest.k() == src.k() * row_stride * col_stride);
+            DLIB_CASSERT(dest.nr() == src.nr() / row_stride);
+            DLIB_CASSERT(dest.nc() == src.nc() / col_stride);
+
+            launch_kernel(_cuda_reorg, dest.size(), dest.k(), dest.nr(), dest.nc(), dest.device(),
+                          src.k(), src.nr(), src.nc(), src.device(), row_stride, col_stride);
+        }
+
+        void reorg_gradient (
+            tensor& grad,
+            const int row_stride,
+            const int col_stride,
+            const tensor& gradient_input
+        )
+        {
+            DLIB_CASSERT(is_same_object(grad, gradient_input)==false);
+            DLIB_CASSERT(grad.nr() % row_stride == 0);
+            DLIB_CASSERT(grad.nc() % col_stride == 0);
+            DLIB_CASSERT(grad.num_samples() == gradient_input.num_samples());
+            DLIB_CASSERT(grad.k() == gradient_input.k() / row_stride / col_stride);
+            DLIB_CASSERT(grad.nr() == gradient_input.nr() * row_stride);
+            DLIB_CASSERT(grad.nc() == gradient_input.nc() * row_stride);
+
+            launch_kernel(_cuda_reorg_gradient, gradient_input.size(), grad.k(), grad.nr(), grad.nc(), grad.device(),
+                          gradient_input.k(), gradient_input.nr(), gradient_input.nc(), gradient_input.device(),
+                          row_stride, col_stride);
         }
 
     // ----------------------------------------------------------------------------------------
@@ -1908,7 +1994,7 @@ namespace dlib
                 for (auto i : grid_stride_range(0, num))
                 {
                     const float val = (s[n*num+i]-m[n])*v[n];
-                    out[n*num+i] = val*g[n]+b[n];
+                    out[n*num+i] = val*g[i]+b[i];
                 }
             }
         }
@@ -1917,21 +2003,17 @@ namespace dlib
         {
             for (auto n : grid_stride_range_y(0, ns))
             {
-                float temp_bg = 0;
-                float temp_gg = 0;
                 float temp_dv = 0;
                 for (auto i : grid_stride_range(0, num))
                 {
                     auto idx = n*num+i;
                     const float x_hat = (s[idx] - m[n])*v[n];
-                    temp_bg += gi[idx];
-                    temp_gg += gi[idx]*x_hat;
+                    bg[i] += gi[idx];
+                    gg[i] += gi[idx]*x_hat;
 
                     const float dx = gi[idx] * g[n];
                     temp_dv += dx*(s[idx] - m[n])*-0.5*v[n]*v[n]*v[n];
                 }
-                warp_reduce_atomic_add(bg[n], temp_bg);
-                warp_reduce_atomic_add(gg[n], temp_gg);
                 warp_reduce_atomic_add(dv[n], temp_dv);
             }
             __syncthreads();
@@ -1942,7 +2024,7 @@ namespace dlib
                 for (auto i : grid_stride_range(0, num))
                 {
                     auto idx = n*num+i;
-                    const float dx = gi[idx]*g[n];
+                    const float dx = gi[idx]*g[i];
                     temp_dm += dx*-v[n] + dv[n] * -2*(s[idx] - m[n])/num;
                 }
                 warp_reduce_atomic_add(dm[n], temp_dm);
@@ -1954,7 +2036,7 @@ namespace dlib
                 for (auto i : grid_stride_range(0, num))
                 {
                     auto idx = n*num+i;
-                    const float dx = gi[idx]*g[n];
+                    const float dx = gi[idx]*g[i];
                     out[idx] += dx*v[n] + dv[n] * 2*(s[idx] - m[n])/num + dm[n]/num;
                 }
             }
@@ -1973,8 +2055,9 @@ namespace dlib
             const long num = src.k() * src.nr() * src.nc();
             DLIB_CASSERT(
                 have_same_dimensions(gamma, beta) &&
-                src.num_samples() == gamma.size() &&
-                src.num_samples() == beta.size() &&
+                src.k() == gamma.k() &&
+                src.nr() == gamma.nr() &&
+                src.nc() == gamma.nc() &&
                 eps > 0,
                 "\ngamma.k():  " << gamma.k() <<
                 "\ngamma.nr(): " << gamma.nr() <<
@@ -1982,9 +2065,9 @@ namespace dlib
                 "\nbeta.k():   " << beta.k() <<
                 "\nbeta.nr():  " << beta.nr() <<
                 "\nbeta.nc():  " << beta.nc() <<
-                "\nsrc.k():   " << src.k() <<
-                "\nsrc.nr():  " << src.nr() <<
-                "\nsrc.nc():  " << src.nc() <<
+                "\nsrc.k():    " << src.k() <<
+                "\nsrc.nr():   " << src.nr() <<
+                "\nsrc.nc():   " << src.nc() <<
                 "\neps:  " << eps
             );
 
@@ -2012,11 +2095,13 @@ namespace dlib
             const long num = src.k() * src.nr() * src.nc();
             DLIB_CASSERT(src.num_samples() == means.size());
             DLIB_CASSERT(src.num_samples() == invstds.size());
-            DLIB_CASSERT(src.num_samples() == gamma.size());
-            DLIB_CASSERT(src.num_samples() == gamma_grad.size());
-            DLIB_CASSERT(src.num_samples() == beta_grad.size());
+            DLIB_CASSERT(src.k() == gamma.k());
+            DLIB_CASSERT(src.nr() == gamma.nr());
+            DLIB_CASSERT(src.nc() == gamma.nc());
             DLIB_CASSERT(have_same_dimensions(gradient_input, src));
             DLIB_CASSERT(have_same_dimensions(gradient_input, src_grad));
+            DLIB_CASSERT(have_same_dimensions(gamma_grad, gamma));
+            DLIB_CASSERT(have_same_dimensions(gamma_grad, beta_grad));
             DLIB_CASSERT(eps > 0);
 
             beta_grad = 0;

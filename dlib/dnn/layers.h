@@ -1371,7 +1371,7 @@ namespace dlib
         template <typename SUBNET>
         void setup (const SUBNET& sub)
         {
-            gamma = alias_tensor(sub.get_output().num_samples());
+            gamma = alias_tensor(1, sub.get_output().k(), sub.get_output().nr(), sub.get_output().nc());
             beta = gamma;
 
             params.set_size(gamma.size()+beta.size());
@@ -1836,23 +1836,6 @@ namespace dlib
                 disable_input_bias(l);
             }
         };
-    }
-
-    template <typename net_type>
-    void set_all_bn_running_stats_window_sizes (
-        net_type& net,
-        unsigned long new_window_size
-    )
-    {
-        visit_layers(net, impl::visitor_bn_running_stats_window_size(new_window_size));
-    }
-
-    template <typename net_type>
-    void disable_duplicative_biases (
-        net_type& net
-    )
-    {
-        visit_layers(net, impl::visitor_disable_input_bias());
     }
 
 // ----------------------------------------------------------------------------------------
@@ -4329,80 +4312,104 @@ namespace dlib
 
 // ----------------------------------------------------------------------------------------
 
-    namespace impl
+    template <long long row_stride = 2, long long col_stride = 2>
+    class reorg_
     {
-        class visitor_fuse_layers
+        static_assert(row_stride >= 1, "The row_stride must be >= 1");
+        static_assert(row_stride >= 1, "The col_stride must be >= 1");
+
+    public:
+        reorg_(
+        )
         {
-            public:
-            template <typename T>
-            void fuse_convolution(T&) const
-            {
-                // disable other layer types
-            }
+        }
 
-            // handle the standard case (convolutional layer followed by affine;
-            template <long nf, long nr, long nc, int sy, int sx, int py, int px, typename U, typename E>
-            void fuse_convolution(add_layer<affine_, add_layer<con_<nf, nr, nc, sy, sx, py, px>, U>, E>& l)
-            {
-                if (l.layer_details().is_disabled())
-                    return;
+        template <typename SUBNET>
+        void setup (const SUBNET& sub)
+        {
+            DLIB_CASSERT(sub.get_output().nr() % row_stride == 0);
+            DLIB_CASSERT(sub.get_output().nc() % col_stride == 0);
+        }
 
-                // get the convolution below the affine layer
-                auto& conv = l.subnet().layer_details();
+        template <typename SUBNET>
+        void forward(const SUBNET& sub, resizable_tensor& output)
+        {
+            output.set_size(
+                sub.get_output().num_samples(),
+                sub.get_output().k() * col_stride * row_stride,
+                sub.get_output().nr() / row_stride,
+                sub.get_output().nc() / col_stride
+            );
+            tt::reorg(output, row_stride, col_stride, sub.get_output());
+        }
 
-                // get the parameters from the affine layer as alias_tensor_instance
-                alias_tensor_instance gamma = l.layer_details().get_gamma();
-                alias_tensor_instance beta = l.layer_details().get_beta();
+        template <typename SUBNET>
+        void backward(const tensor& gradient_input, SUBNET& sub, tensor& /*params_grad*/)
+        {
+            tt::reorg_gradient(sub.get_gradient_input(), row_stride, col_stride, gradient_input);
+        }
 
-                if (conv.bias_is_disabled())
-                {
-                    conv.enable_bias();
-                }
+        inline dpoint map_input_to_output (dpoint p) const
+        {
+            p.x() = p.x() / col_stride;
+            p.y() = p.y() / row_stride;
+            return p;
+        }
+        inline dpoint map_output_to_input (dpoint p) const
+        {
+            p.x() = p.x() * col_stride;
+            p.y() = p.y() * row_stride;
+            return p;
+        }
 
-                tensor& params = conv.get_layer_params();
+        const tensor& get_layer_params() const { return params; }
+        tensor& get_layer_params() { return params; }
 
-                // update the biases
-                auto biases = alias_tensor(1, conv.num_filters());
-                biases(params, params.size() - conv.num_filters()) += mat(beta);
+        friend void serialize(const reorg_& /*item*/, std::ostream& out)
+        {
+            serialize("reorg_", out);
+            serialize(row_stride, out);
+            serialize(col_stride, out);
+        }
 
-                // guess the number of input channels
-                const long k_in = (params.size() - conv.num_filters()) / conv.num_filters() / conv.nr() / conv.nc();
+        friend void deserialize(reorg_& /*item*/, std::istream& in)
+        {
+            std::string version;
+            deserialize(version, in);
+            if (version != "reorg_")
+                throw serialization_error("Unexpected version '"+version+"' found while deserializing dlib::reorg_.");
+            long long rs;
+            long long cs;
+            deserialize(rs, in);
+            deserialize(cs, in);
+            if (rs != row_stride) throw serialization_error("Wrong row_stride found while deserializing dlib::reorg_");
+            if (cs != col_stride) throw serialization_error("Wrong col_stride found while deserializing dlib::reorg_");
+        }
 
-                // rescale the filters
-                DLIB_CASSERT(conv.num_filters() == gamma.k());
-                alias_tensor filter(1, k_in, conv.nr(), conv.nc());
-                const float* g = gamma.host();
-                for (long n = 0; n < conv.num_filters(); ++n)
-                {
-                    filter(params, n * filter.size()) *= g[n];
-                }
+        friend std::ostream& operator<<(std::ostream& out, const reorg_& /*item*/)
+        {
+            out << "reorg\t ("
+                << "row_stride=" << row_stride
+                << ", col_stride=" << col_stride
+                << ")";
+            return out;
+        }
 
-                // disable the affine layer
-                l.layer_details().disable();
-            }
+        friend void to_xml(const reorg_ /*item*/, std::ostream& out)
+        {
+            out << "<reorg";
+            out << " row_stride='" << row_stride << "'";
+            out << " col_stride='" << col_stride << "'";
+            out << "/>\n";
+        }
 
-            template <typename input_layer_type>
-            void operator()(size_t , input_layer_type& ) const
-            {
-                // ignore other layers
-            }
+    private:
+        resizable_tensor params; // unused
 
-            template <typename T, typename U, typename E>
-            void operator()(size_t , add_layer<T, U, E>& l)
-            {
-                fuse_convolution(l);
-            }
-        };
-    }
+    };
 
-    template <typename net_type>
-    void fuse_layers (
-        net_type& net
-    )
-    {
-        DLIB_CASSERT(count_parameters(net) > 0, "The network has to be allocated before fusing the layers.");
-        visit_layers(net, impl::visitor_fuse_layers());
-    }
+    template <typename SUBNET>
+    using reorg = add_layer<reorg_<2, 2>, SUBNET>;
 
 // ----------------------------------------------------------------------------------------
 

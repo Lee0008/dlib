@@ -6,7 +6,6 @@
 #include "loss_abstract.h"
 #include "core.h"
 #include "utilities.h"
-#include "misc.h"
 #include "../matrix.h"
 #include "../cuda/tensor_tools.h"
 #include "../geometry.h"
@@ -745,7 +744,7 @@ namespace dlib
         unsigned long total_num_labels = 0;
 
         // We make it true that: possible_labels[classifier][label_idx_lookup[classifier][label]] == label
-        std::map<std::string, std::map<std::string,long>> label_idx_lookup;
+        std::map<std::string, std::map<std::string, size_t>> label_idx_lookup;
 
 
         // Scratch doesn't logically contribute to the state of this object.  It's just
@@ -2188,8 +2187,8 @@ namespace dlib
             {
                 // These values used to be hard coded, so for this version of the metric
                 // learning loss we just use these values.
-                item.margin = 0.1;
-                item.dist_thresh = 0.75;
+                item.margin = 0.1f;
+                item.dist_thresh = 0.75f;
                 return;
             }
             else if (version == "loss_metric_2")
@@ -2215,8 +2214,8 @@ namespace dlib
         }
 
     private:
-        float margin = 0.04;
-        float dist_thresh = 0.6;
+        float margin = 0.04f;
+        float dist_thresh = 0.6f;
 
 
         // These variables are only here to avoid being reallocated over and over in
@@ -3625,25 +3624,26 @@ namespace dlib
 
                 for (size_t a = 0; a < anchors.size(); ++a)
                 {
+                    const long k = a * num_feats;
                     for (long r = 0; r < output_tensor.nr(); ++r)
                     {
                         for (long c = 0; c < output_tensor.nc(); ++c)
                         {
-                            const float obj = out_data[tensor_index(output_tensor, n, a * num_feats + 4, r, c)];
+                            const float obj = out_data[tensor_index(output_tensor, n, k + 4, r, c)];
                             if (obj > adjust_threshold)
                             {
-                                const auto x = out_data[tensor_index(output_tensor, n, a * num_feats + 0, r, c)];
-                                const auto y = out_data[tensor_index(output_tensor, n, a * num_feats + 1, r, c)];
-                                const auto w = out_data[tensor_index(output_tensor, n, a * num_feats + 2, r, c)];
-                                const auto h = out_data[tensor_index(output_tensor, n, a * num_feats + 3, r, c)];
+                                const auto x = out_data[tensor_index(output_tensor, n, k + 0, r, c)] * 2.0 - 0.5;
+                                const auto y = out_data[tensor_index(output_tensor, n, k + 1, r, c)] * 2.0 - 0.5;
+                                const auto w = out_data[tensor_index(output_tensor, n, k + 2, r, c)];
+                                const auto h = out_data[tensor_index(output_tensor, n, k + 3, r, c)];
                                 yolo_rect det(centered_drect(dpoint((x + c) * stride_x, (y + r) * stride_y),
                                                              w / (1 - w) * anchors[a].width,
                                                              h / (1 - h) * anchors[a].height));
-                                for (long k = 0; k < num_classes; ++k)
+                                for (long i = 0; i < num_classes; ++i)
                                 {
-                                    const float conf = obj * out_data[tensor_index(output_tensor, n, a * num_feats + 5 + k, r, c)];
+                                    const float conf = obj * out_data[tensor_index(output_tensor, n, k + 5 + i, r, c)];
                                     if (conf > adjust_threshold)
-                                        det.labels.emplace_back(conf, options.labels[k]);
+                                        det.labels.emplace_back(conf, options.labels[i]);
                                 }
                                 if (!det.labels.empty())
                                 {
@@ -3692,18 +3692,16 @@ namespace dlib
                     {
                         for (size_t a = 0; a < anchors.size(); ++a)
                         {
-                            const auto x_idx = tensor_index(output_tensor, n, a * num_feats + 0, r, c);
-                            const auto y_idx = tensor_index(output_tensor, n, a * num_feats + 1, r, c);
-                            const auto w_idx = tensor_index(output_tensor, n, a * num_feats + 2, r, c);
-                            const auto h_idx = tensor_index(output_tensor, n, a * num_feats + 3, r, c);
-                            const auto o_idx = tensor_index(output_tensor, n, a * num_feats + 4, r, c);
+                            const long k = a * num_feats;
+                            const auto x = out_data[tensor_index(output_tensor, n, k + 0, r, c)] * 2.0 - 0.5;
+                            const auto y = out_data[tensor_index(output_tensor, n, k + 1, r, c)] * 2.0 - 0.5;
+                            const auto w = out_data[tensor_index(output_tensor, n, k + 2, r, c)];
+                            const auto h = out_data[tensor_index(output_tensor, n, k + 3, r, c)];
 
                             // The prediction at r, c for anchor a
-                            const yolo_rect pred(centered_drect(
-                                dpoint((out_data[x_idx] + c) * stride_x, (out_data[y_idx] + r) * stride_y),
-                                out_data[w_idx] / (1 - out_data[w_idx]) * anchors[a].width,
-                                out_data[h_idx] / (1 - out_data[h_idx]) * anchors[a].height
-                            ));
+                            const yolo_rect pred(centered_drect(dpoint((x + c) * stride_x, (y + r) * stride_y),
+                                                                w / (1 - w) * anchors[a].width,
+                                                                h / (1 - h) * anchors[a].height));
 
                             // Find the best IoU for all ground truth boxes
                             double best_iou = 0;
@@ -3715,6 +3713,7 @@ namespace dlib
                             }
 
                             // Incur loss for the boxes that are below a certain IoU threshold with any truth box
+                            const auto o_idx = tensor_index(output_tensor, n, k + 4, r, c);
                             if (best_iou < options.iou_ignore_threshold)
                                 g[o_idx] = options.lambda_obj * out_data[o_idx];
                         }
@@ -3764,14 +3763,7 @@ namespace dlib
 
                             const long c = t_center.x() / stride_x;
                             const long r = t_center.y() / stride_y;
-                            const auto x_idx = tensor_index(output_tensor, n, a * num_feats + 0, r, c);
-                            const auto y_idx = tensor_index(output_tensor, n, a * num_feats + 1, r, c);
-                            const auto w_idx = tensor_index(output_tensor, n, a * num_feats + 2, r, c);
-                            const auto h_idx = tensor_index(output_tensor, n, a * num_feats + 3, r, c);
-                            const auto o_idx = tensor_index(output_tensor, n, a * num_feats + 4, r, c);
-
-                            // This grid cell should detect an object
-                            g[o_idx] = options.lambda_obj * (out_data[o_idx] - 1);
+                            const long k = a * num_feats;
 
                             // Get the truth box target values
                             const double tx = t_center.x() / stride_x - c;
@@ -3783,16 +3775,24 @@ namespace dlib
                             const double scale_box = options.lambda_box * (2 - truth_box.rect.area() / input_rect.area());
 
                             // Compute the gradient for the box coordinates
-                            g[x_idx] = scale_box * (out_data[x_idx] - tx);
-                            g[y_idx] = scale_box * (out_data[y_idx] - ty);
+                            const auto x_idx = tensor_index(output_tensor, n, k + 0, r, c);
+                            const auto y_idx = tensor_index(output_tensor, n, k + 1, r, c);
+                            const auto w_idx = tensor_index(output_tensor, n, k + 2, r, c);
+                            const auto h_idx = tensor_index(output_tensor, n, k + 3, r, c);
+                            g[x_idx] = scale_box * (out_data[x_idx] * 2.0 - 0.5 - tx);
+                            g[y_idx] = scale_box * (out_data[y_idx] * 2.0 - 0.5 - ty);
                             g[w_idx] = scale_box * (out_data[w_idx] - tw);
                             g[h_idx] = scale_box * (out_data[h_idx] - th);
 
+                            // This grid cell should detect an object
+                            const auto o_idx = tensor_index(output_tensor, n, k + 4, r, c);
+                            g[o_idx] = options.lambda_obj * (out_data[o_idx] - 1);
+
                             // Compute the classification error
-                            for (long k = 0; k < num_classes; ++k)
+                            for (long i = 0; i < num_classes; ++i)
                             {
-                                const auto c_idx = tensor_index(output_tensor, n, a * num_feats + 5 + k, r, c);
-                                if (truth_box.label == options.labels[k])
+                                const auto c_idx = tensor_index(output_tensor, n, k + 5 + i, r, c);
+                                if (truth_box.label == options.labels[i])
                                     g[c_idx] = options.lambda_cls * (out_data[c_idx] - 1);
                                 else
                                     g[c_idx] = options.lambda_cls * out_data[c_idx];
@@ -3905,7 +3905,7 @@ namespace dlib
             if (count != tag_count())
                 throw serialization_error("Invalid number of detection tags " + std::to_string(count) +
                                           ", while deserializing dlib::loss_yolo_, expecting " +
-                                          std::to_string(tag_count()) + "tags instead.");
+                                          std::to_string(tag_count()) + " tags instead.");
             deserialize(item.options, in);
         }
 
@@ -4015,9 +4015,6 @@ namespace dlib
 
             // Normalize both batches independently across the batch dimension
             const double eps = 1e-4;
-            resizable_tensor za_norm, means_a, invstds_a;
-            resizable_tensor zb_norm, means_b, invstds_b;
-            resizable_tensor rms, rvs, g, b;
             g.set_size(1, sample_size);
             g = 1;
             b.set_size(1, sample_size);
@@ -4026,21 +4023,29 @@ namespace dlib
             tt::batch_normalize(eps, zb_norm, means_b, invstds_b, 1, rms, rvs, zb, g, b);
 
             // Compute the empirical cross-correlation matrix
-            resizable_tensor eccm;
             eccm.set_size(sample_size, sample_size);
             tt::gemm(0, eccm, 1, za_norm, true, zb_norm, false);
             eccm /= batch_size;
 
-            // Compute the loss: MSE between eccm and the identity matrix.
-            // Off-diagonal terms are weighed by lambda.
-            const matrix<float> C = mat(eccm);
-            const double diagonal_loss = sum(squared(diag(C) - 1));
-            const double off_diag_loss = sum(squared(C - diagm(diag(C))));
-            double loss = diagonal_loss + lambda * off_diag_loss;
+            // Set sizes and setup auxiliary tensors
+            if (!have_same_dimensions(eccm, identity))
+                identity = identity_matrix<float>(sample_size);
+            if (!have_same_dimensions(eccm, cdiag))
+                cdiag.copy_size(eccm);
+            if (!have_same_dimensions(eccm, cdiag_1))
+                cdiag_1.copy_size(eccm);
+            if (!have_same_dimensions(eccm, off_mask))
+                off_mask = ones_matrix<float>(sample_size, sample_size) - identity_matrix<float>(sample_size);
+            if (!have_same_dimensions(eccm, off_diag))
+                off_diag.copy_size(eccm);
+            if (!have_same_dimensions(grad, grad_input))
+                grad_input.copy_size(grad);
+            if (!have_same_dimensions(g_grad, g))
+                g_grad.copy_size(g);
+            if (!have_same_dimensions(b_grad, b))
+                b_grad.copy_size(b);
 
             // Loss gradient, which will be used as the input of the batch normalization gradient
-            resizable_tensor grad_input;
-            grad_input.copy_size(grad);
             auto grad_input_a = split(grad_input);
             auto grad_input_b = split(grad_input, offset);
 
@@ -4050,11 +4055,15 @@ namespace dlib
             // C = eccm
             // D = off_mask: a mask that keeps only the elements outside the diagonal
 
+            // A diagonal matrix containing the diagonal of eccm
+            tt::multiply(false, cdiag, eccm, identity);
+            // The diagonal of eccm minus the identity matrix
+            tt::affine_transform(cdiag_1, cdiag, identity, 1, -1);
+
             // diagonal term: sum((diag(A' * B) - vector(1)).^2)
             // --------------------------------------------
             // 	=> d/dA = 2 * B * diag(diag(A' * B) - vector(1)) = 2 * B * diag(diag(C) - vector(1))
             // 	=> d/dB = 2 * A * diag(diag(A' * B) - vector(1)) = 2 * A * diag(diag(C) - vector(1))
-            resizable_tensor cdiag_1(diagm(diag(mat(eccm) - 1)));
             tt::gemm(0, grad_input_a, 2, zb_norm, false, cdiag_1, false);
             tt::gemm(0, grad_input_b, 2, za_norm, false, cdiag_1, false);
 
@@ -4062,22 +4071,21 @@ namespace dlib
             // --------------------------------
             //  => d/dA = 2 * B * ((B' * A) .* (D .* D)') = 2 * B * (C .* (D .* D)) = 2 * B * (C .* D)
             //  => d/dB = 2 * A * ((A' * B) .* (D .* D))  = 2 * A * (C .* (D .* D)) = 2 * A * (C .* D)
-            resizable_tensor off_mask(ones_matrix<float>(sample_size, sample_size) - identity_matrix<float>(sample_size));
-            resizable_tensor off_diag(sample_size, sample_size);
             tt::multiply(false, off_diag, eccm, off_mask);
-            tt::gemm(1, grad_input_a, lambda, zb_norm, false, off_diag, false);
-            tt::gemm(1, grad_input_b, lambda, za_norm, false, off_diag, false);
+            tt::gemm(1, grad_input_a, 2 * lambda, zb_norm, false, off_diag, false);
+            tt::gemm(1, grad_input_b, 2 * lambda, za_norm, false, off_diag, false);
 
             // Compute the batch norm gradients, g and b grads are not used
-            resizable_tensor g_grad, b_grad;
-            g_grad.copy_size(g);
-            b_grad.copy_size(b);
             auto gza = split(grad);
             auto gzb = split(grad, offset);
             tt::batch_normalize_gradient(eps, grad_input_a, means_a, invstds_a, za, g, gza, g_grad, b_grad);
             tt::batch_normalize_gradient(eps, grad_input_b, means_b, invstds_b, zb, g, gzb, g_grad, b_grad);
 
-            return loss;
+            // Compute the loss: MSE between eccm and the identity matrix.
+            // Off-diagonal terms are weighed by lambda.
+            const double diagonal_loss = sum(squared(mat(cdiag_1)));
+            const double off_diag_loss = sum(squared(mat(off_diag)));
+            return diagonal_loss + lambda * off_diag_loss;
         }
 
         float get_lambda() const  { return lambda; }
@@ -4115,6 +4123,11 @@ namespace dlib
 
     private:
         float lambda = 0.0051;
+        mutable resizable_tensor za_norm, means_a, invstds_a;
+        mutable resizable_tensor zb_norm, means_b, invstds_b;
+        mutable resizable_tensor rms, rvs, g, b;
+        mutable resizable_tensor eccm, grad_input, g_grad, b_grad;
+        mutable resizable_tensor cdiag, cdiag_1, identity, off_mask, off_diag;
     };
 
     template <typename SUBNET>

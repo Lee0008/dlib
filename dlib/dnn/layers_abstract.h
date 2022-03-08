@@ -1824,23 +1824,6 @@ namespace dlib
 // ----------------------------------------------------------------------------------------
 
     template <typename net_type>
-    void set_all_bn_running_stats_window_sizes (
-        const net_type& net,
-        unsigned long new_window_size
-    );
-    /*!
-        requires
-            - new_window_size > 0
-            - net_type is an object of type add_layer, add_loss_layer, add_skip_layer, or
-              add_tag_layer.
-        ensures
-            - Sets the get_running_stats_window_size() field of all bn_ layers in net to
-              new_window_size.
-    !*/
-
-// ----------------------------------------------------------------------------------------
-
-    template <typename net_type>
     void disable_duplicative_biases (
         const net_type& net
     );
@@ -3302,20 +3285,56 @@ namespace dlib
 
 // ----------------------------------------------------------------------------------------
 
-    template <typename net_type>
-    void fuse_layers (
-        net_type& net
-    );
-    /*!
-        requires
-            - net_type is an object of type add_layer, add_loss_layer, add_skip_layer, or
-              add_tag_layer.
-            - net has been properly allocated, that is: count_parameters(net) > 0.
-        ensures
-            - Disables all the affine_ layers that have a convolution as an input.
-            - Updates the convolution weights beneath the affine_ layers to produce the same
-              output as with the affine_ layers enabled.
-    !*/
+    template <long long row_stride = 2, long long col_stride = 2>
+    class reorg_
+    {
+        /*!
+            REQUIREMENTS ON TEMPLATE ARGUMENTS
+                - row_stride >= 1
+                - col_stride >= 1
+
+            WHAT THIS OBJECT REPRESENTS
+                This is an implementation of the EXAMPLE_COMPUTATIONAL_LAYER_ interface
+                defined above.  In particular, the output of this layer is simply a copy of
+                the input tensor.  However, it rearranges spatial information along the
+                channel dimension.  The dimensions of the tensor output by this layer are as
+                follows (letting IN be the input tensor and OUT the output tensor):
+                    - OUT.num_samples() == IN.num_samples()
+                    - OUT.k()  == IN.k() * row_stride * col_stride
+                    - OUT.nr() == IN.nr() / row_stride
+                    - OUT.nc() == IN.nc() / col_stride
+
+                So the output will always have the same number of samples as the input, but
+                within each sample (the k,nr,nc part) we will reorganize the values.  To be
+                very precise, we will have, for all n, k, r, c in OUT:
+                OUT.host[tensor_index(OUT, n, k, r, c)] ==
+                IN.host[tensor_index(IN,
+                                      n,
+                                      k % IN.k(),
+                                      r * row_stride + (k / IN.k()) / row_stride,
+                                      c * col_stride + (k / IN.k()) % col_stride)]
+
+
+                Finally, you can think of this layer as an alternative to a strided convolutonal
+                layer to downsample a tensor.
+        !*/
+
+    public:
+
+        template <typename SUBNET> void setup (const SUBNET& sub);
+        template <typename SUBNET> void forward(const SUBNET& sub, resizable_tensor& output);
+        template <typename SUBNET> void backward(const tensor& gradient_input, SUBNET& sub, tensor& params_grad);
+        dpoint map_input_to_output (dpoint p) const;
+        dpoint map_output_to_input (dpoint p) const;
+        const tensor& get_layer_params() const;
+        tensor& get_layer_params();
+        /*!
+            These functions are implemented as described in the EXAMPLE_COMPUTATIONAL_LAYER_ interface.
+        !*/
+    };
+
+    template <typename SUBNET>
+    using reorg = add_layer<reorg_<2, 2>, SUBNET>;
 
 // ----------------------------------------------------------------------------------------
 
